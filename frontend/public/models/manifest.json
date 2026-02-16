@@ -1,0 +1,22 @@
+{
+  "human_male": "characters/human_male.glb",
+  "human_female": "characters/human_female.glb",
+  "orc_male": "characters/orc_male.glb",
+  "orc_female": "characters/orc_female.glb",
+  "dwarf_male": "characters/dwarf_male.glb",
+  "dwarf_female": "characters/dwarf_female.glb",
+  "nightelf_male": "characters/nightelf_male.glb",
+  "nightelf_female": "characters/nightelf_female.glb",
+  "undead_male": "characters/undead_male.glb",
+  "undead_female": "characters/undead_female.glb",
+  "tauren_male": "characters/tauren_male.glb",
+  "tauren_female": "characters/tauren_female.glb",
+  "gnome_male": "characters/gnome_male.glb",
+  "gnome_female": "characters/gnome_female.glb",
+  "troll_male": "characters/troll_male.glb",
+  "troll_female": "characters/troll_female.glb",
+  "bloodelf_male": "characters/bloodelf_male.glb",
+  "bloodelf_female": "characters/bloodelf_female.glb",
+  "draenei_male": "characters/draenei_male.glb",
+  "draenei_female": "characters/draenei_female.glb"
+}

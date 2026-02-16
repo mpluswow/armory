@@ -1,0 +1,14 @@
+[Unit]
+Description=AzerothCore Armory API
+After=network.target mysql.service
+
+[Service]
+User=dr3am
+WorkingDirectory=/home/dr3am/armory/backend
+EnvironmentFile=/home/dr3am/armory/.env
+ExecStart=/home/dr3am/armory/backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

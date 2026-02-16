@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+venv/
+.venv/
+node_modules/
+dist/
+.vite/
+*.glb
+*.gltf
+frontend/public/models/characters/*.glb
+frontend/public/models/items/*.glb
+Data/
+*.MPQ

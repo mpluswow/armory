@@ -1,0 +1,24 @@
+INFO:     Started server process [1578]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:57353 - "GET /api/characters HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60397 - "GET /api/characters HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60401 - "GET /api/character?name=Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60407 - "GET /api/model-extra-skin-texture/Test HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:60405 - "GET /api/model-hair-texture/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60433 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60421 - "GET /api/model-texture/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58883 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59729 - "GET /api/characters HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59743 - "GET /api/character?name=Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59751 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59773 - "GET /api/model-extra-skin-texture/Test HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59767 - "GET /api/model-texture/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59781 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57547 - "GET /api/characters HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57555 - "GET /api/character?name=Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57585 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57593 - "GET /api/model-extra-skin-texture/Test HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:57573 - "GET /api/model-texture/Test HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57597 - "GET /api/model-geosets/Test HTTP/1.1" 200 OK
