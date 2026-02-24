@@ -35,6 +35,33 @@ echo -e "${CYAN}  AzerothCore Armory Launcher${NC}"
 echo -e "${CYAN}==============================${NC}"
 echo ""
 
+# System dependencies
+MISSING_DEPS=()
+
+if ! command -v python3 &>/dev/null; then
+    MISSING_DEPS+=("python3  (sudo apt install python3)")
+fi
+
+if command -v python3 &>/dev/null && ! python3 -m venv --help &>/dev/null; then
+    MISSING_DEPS+=("python3-venv  (sudo apt install python3-venv)")
+fi
+
+if ! command -v node &>/dev/null; then
+    MISSING_DEPS+=("node  (https://nodejs.org or: sudo apt install nodejs)")
+fi
+
+if ! command -v npm &>/dev/null; then
+    MISSING_DEPS+=("npm  (sudo apt install npm)")
+fi
+
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+    echo -e "${RED}ERROR: Missing system dependencies:${NC}"
+    for dep in "${MISSING_DEPS[@]}"; do
+        echo -e "  - $dep"
+    done
+    exit 1
+fi
+
 # .env
 if [[ ! -f "$ROOT/.env" ]]; then
     echo -e "${RED}ERROR: .env not found. Copy .env.example and fill in your DB credentials:${NC}"
@@ -64,7 +91,9 @@ fi
 if [[ ! -f "$FRONTEND_DIR/public/models/manifest.json" ]]; then
     echo -e "${YELLOW}WARNING: No extracted models found.${NC}"
     echo "  Run the extraction pipeline first:"
-    echo "  tools/venv/bin/python tools/extract_models.py --data-dir ./Data --output-dir ./frontend/public/models"
+    echo "    python3 -m venv $ROOT/tools/venv"
+    echo "    $ROOT/tools/venv/bin/pip install -r $ROOT/tools/requirements.txt"
+    echo "    $ROOT/tools/venv/bin/python $ROOT/tools/extract_models.py --data-dir $ROOT/Data --output-dir $ROOT/frontend/public/models"
     echo ""
 fi
 

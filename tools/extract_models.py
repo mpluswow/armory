@@ -174,6 +174,35 @@ class MPQArchive:
         return results
 
 
+# ── Persistent MPQ pool (avoids reopening multi-GB archives per request) ──
+
+_mpq_pool: dict[str, MPQArchive] = {}
+
+
+def _get_mpq(mpq_path: str) -> MPQArchive | None:
+    """Get or open an MPQ archive from the persistent pool."""
+    if mpq_path not in _mpq_pool:
+        try:
+            mpq = MPQArchive(mpq_path)
+            mpq.__enter__()
+            _mpq_pool[mpq_path] = mpq
+        except OSError:
+            return None
+    return _mpq_pool[mpq_path]
+
+
+def _read_from_mpqs(mpq_paths: list[str], file_path: str) -> bytes | None:
+    """Read a file from the first MPQ archive that contains it (highest priority first)."""
+    for mpq_path in reversed(mpq_paths):
+        mpq = _get_mpq(mpq_path)
+        if mpq is None:
+            continue
+        data = mpq.read_file(file_path)
+        if data:
+            return data
+    return None
+
+
 # ── M2 Parser (WotLK 3.3.5 format, version 264) ─────────────────────────
 
 def _read_m2_header(data: bytes) -> dict:
@@ -225,13 +254,21 @@ def _read_m2_vertices(data: bytes, header: dict) -> np.ndarray:
     return raw.reshape(n, vertex_size)
 
 
-def _parse_vertices(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _parse_vertices(
+    raw: np.ndarray,
+    bone_matrices: list[np.ndarray] | None = None,
+    bone_remap: dict[int, tuple] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract positions, normals, and UVs from raw vertex data.
 
     WoW M2 coordinate system: X=right, Y=forward, Z=up
     glTF coordinate system:   X=right, Y=up, Z=forward (towards viewer)
 
     Conversion: glTF(x, y, z) = WoW(x, z, -y)
+
+    If bone_matrices + bone_remap are provided, applies vertex skinning (Stand pose baking).
+    bone_remap maps M2 vertex index → (bone0, bone1, bone2, bone3) from the skin file.
+    Vertex bone weights are read from the M2 vertex data (offset 12, 4 x uint8).
     """
     n = raw.shape[0]
     if n == 0:
@@ -242,17 +279,89 @@ def _parse_vertices(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
     normals = np.zeros((n, 3), dtype=np.float32)
     uvs = np.zeros((n, 2), dtype=np.float32)
 
+    do_skinning = (bone_matrices is not None and bone_remap is not None
+                   and len(bone_matrices) > 0 and len(bone_remap) > 0)
+    n_bones = len(bone_matrices) if bone_matrices else 0
+
     for i in range(n):
         base = i * 48
         wx, wy, wz = struct.unpack_from("<3f", flat, base)
         nx, ny, nz = struct.unpack_from("<3f", flat, base + 20)
         uvs[i] = struct.unpack_from("<2f", flat, base + 32)
 
+        if do_skinning and i in bone_remap:
+            # Read bone weights from M2 vertex data
+            bw = struct.unpack_from("<4B", flat, base + 12)  # weights (0-255)
+            # Get corrected bone indices from skin file's per-vertex bone remap
+            bi = bone_remap[i]  # (bone0, bone1, bone2, bone3) — M2 bone indices
+
+            # Apply vertex skinning: weighted sum of bone transforms
+            sp = np.zeros(3, dtype=np.float64)
+            sn = np.zeros(3, dtype=np.float64)
+            pos_wow = np.array([wx, wy, wz, 1.0], dtype=np.float64)
+            norm_wow = np.array([nx, ny, nz, 0.0], dtype=np.float64)
+
+            for j in range(4):
+                w = bw[j] / 255.0
+                if w < 0.001:
+                    continue
+                bidx = bi[j]
+                if bidx >= n_bones:
+                    sp += w * pos_wow[:3]
+                    sn += w * norm_wow[:3]
+                    continue
+                mat = bone_matrices[bidx]
+                sp += w * (mat @ pos_wow)[:3]
+                sn += w * (mat @ norm_wow)[:3]
+
+            wx, wy, wz = sp[0], sp[1], sp[2]
+            nx, ny, nz = sn[0], sn[1], sn[2]
+            # Re-normalize the normal
+            nl = (nx * nx + ny * ny + nz * nz) ** 0.5
+            if nl > 1e-6:
+                nx, ny, nz = nx / nl, ny / nl, nz / nl
+
         # WoW -> glTF coordinate conversion
         positions[i] = (wx, wz, -wy)
         normals[i] = (nx, nz, -ny)
 
     return positions, normals, uvs
+
+
+def _read_skin_bone_remap(skin_data: bytes) -> dict[int, tuple] | None:
+    """Read per-vertex bone indices from the .skin file.
+
+    The skin file has a vertex list (local → M2 vertex index) and a bone list
+    (4 x uint8 per local vertex = actual M2 bone indices to use).
+    Returns dict mapping M2 vertex index → (bone0, bone1, bone2, bone3).
+    """
+    if len(skin_data) < 48:
+        return None
+    offset = 4 if skin_data[0:4] == b"SKIN" else 0
+
+    nVerts, ofsVerts = struct.unpack_from("<II", skin_data, offset)
+    nBones, ofsBones = struct.unpack_from("<II", skin_data, offset + 16)
+
+    if nVerts == 0 or nBones == 0:
+        return None
+    if nBones != nVerts:
+        return None  # Should be 1:1
+    if ofsVerts + nVerts * 2 > len(skin_data):
+        return None
+    if ofsBones + nBones * 4 > len(skin_data):
+        return None
+
+    # Local vertex index → M2 global vertex index
+    vert_lookup = np.frombuffer(skin_data, dtype=np.uint16, count=nVerts, offset=ofsVerts)
+
+    # Build mapping: M2 vertex index → 4 bone indices from skin file
+    remap = {}
+    for i in range(nVerts):
+        m2_idx = int(vert_lookup[i])
+        bones = struct.unpack_from("<4B", skin_data, ofsBones + i * 4)
+        remap[m2_idx] = bones
+
+    return remap
 
 
 def _read_skin_file(skin_data: bytes) -> list[dict] | None:
@@ -820,6 +929,455 @@ def build_glb(
     print(f"  Saved: {output_path} ({os.path.getsize(output_path)} bytes, {len(submeshes)} geosets)")
 
 
+# ── M2 Attachment Point Extraction ──────────────────────────────────────
+
+# ── M2 Bone / Animation Frame 0 ──────────────────────────────────────────────
+
+
+def _read_m2_track_vec3(
+    m2_data: bytes, track_offset: int, anim_idx: int = 0
+) -> tuple[float, float, float] | None:
+    """Read frame 0 C3Vector value from an M2Track at the given offset.
+
+    M2Track layout (20 bytes):
+      interpolation(u16) + globalSeq(u16) + timestamps M2Array(8) + values M2Array(8)
+    The values M2Array is M2Array< M2Array<C3Vector> > (outer=per-sequence, inner=keyframes).
+    """
+    if track_offset + 20 > len(m2_data):
+        return None
+    # Values outer array: count + offset at track_offset + 12
+    n_seqs, ofs_seqs = struct.unpack_from("<II", m2_data, track_offset + 12)
+    if n_seqs == 0:
+        return None
+    idx = min(anim_idx, n_seqs - 1)
+    inner_ptr = ofs_seqs + idx * 8
+    if inner_ptr + 8 > len(m2_data):
+        return None
+    n_keys, ofs_keys = struct.unpack_from("<II", m2_data, inner_ptr)
+    if n_keys == 0:
+        return None
+    if ofs_keys + 12 > len(m2_data):
+        return None
+    return struct.unpack_from("<3f", m2_data, ofs_keys)
+
+
+def _read_m2_track_quat(
+    m2_data: bytes, track_offset: int, anim_idx: int = 0
+) -> tuple[float, float, float, float] | None:
+    """Read frame 0 compressed quaternion from an M2Track.
+
+    M2CompQuat: 4x int16 (8 bytes). Decompress to float quaternion.
+    """
+    if track_offset + 20 > len(m2_data):
+        return None
+    n_seqs, ofs_seqs = struct.unpack_from("<II", m2_data, track_offset + 12)
+    if n_seqs == 0:
+        return None
+    idx = min(anim_idx, n_seqs - 1)
+    inner_ptr = ofs_seqs + idx * 8
+    if inner_ptr + 8 > len(m2_data):
+        return None
+    n_keys, ofs_keys = struct.unpack_from("<II", m2_data, inner_ptr)
+    if n_keys == 0:
+        return None
+    if ofs_keys + 8 > len(m2_data):
+        return None
+    ix, iy, iz, iw = struct.unpack_from("<4h", m2_data, ofs_keys)
+
+    def decomp(v: int) -> float:
+        return (v + 32768) / 32767.0 - 1.0 if v < 0 else (v - 32767) / 32767.0
+
+    qx, qy, qz, qw = decomp(ix), decomp(iy), decomp(iz), decomp(iw)
+    # Normalize
+    length = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
+    if length > 1e-6:
+        qx, qy, qz, qw = qx / length, qy / length, qz / length, qw / length
+    else:
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+    return (qx, qy, qz, qw)
+
+
+def _quat_to_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
+    """Convert quaternion (x, y, z, w) to a 4x4 rotation matrix."""
+    x, y, z, w = q
+    m = np.eye(4, dtype=np.float64)
+    m[0, 0] = 1 - 2 * (y * y + z * z)
+    m[0, 1] = 2 * (x * y - z * w)
+    m[0, 2] = 2 * (x * z + y * w)
+    m[1, 0] = 2 * (x * y + z * w)
+    m[1, 1] = 1 - 2 * (x * x + z * z)
+    m[1, 2] = 2 * (y * z - x * w)
+    m[2, 0] = 2 * (x * z - y * w)
+    m[2, 1] = 2 * (y * z + x * w)
+    m[2, 2] = 1 - 2 * (x * x + y * y)
+    return m
+
+
+def _matrix_to_quat(m: np.ndarray) -> tuple[float, float, float, float]:
+    """Extract quaternion (x, y, z, w) from the rotation part of a 4x4 matrix."""
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0:
+        s = 0.5 / (trace + 1.0) ** 0.5
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * (1.0 + m[0, 0] - m[1, 1] - m[2, 2]) ** 0.5
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * (1.0 + m[1, 1] - m[0, 0] - m[2, 2]) ** 0.5
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * (1.0 + m[2, 2] - m[0, 0] - m[1, 1]) ** 0.5
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    length = (x * x + y * y + z * z + w * w) ** 0.5
+    if length > 1e-6:
+        x, y, z, w = x / length, y / length, z / length, w / length
+    return (x, y, z, w)
+
+
+def _find_stand_anim_index(m2_data: bytes) -> int:
+    """Find the sequence index for the Stand animation (animId=0).
+
+    M2 sequences are at header offset 0x1C (M2Array), each 64 bytes.
+    The animationID is a uint16 at offset 0 of each sequence record.
+    Stand animation has animId=0.
+    Returns the sequence index, or 0 as fallback.
+    """
+    if len(m2_data) < 0x24:
+        return 0
+    n_seqs = struct.unpack_from("<I", m2_data, 0x1C)[0]
+    ofs_seqs = struct.unpack_from("<I", m2_data, 0x20)[0]
+    if n_seqs == 0 or ofs_seqs == 0:
+        return 0
+
+    seq_size = 64
+    for i in range(n_seqs):
+        base = ofs_seqs + i * seq_size
+        if base + 2 > len(m2_data):
+            break
+        anim_id = struct.unpack_from("<H", m2_data, base)[0]
+        if anim_id == 0:  # Stand
+            return i
+    return 0  # Fallback if no Stand found
+
+
+def _compute_bone_world_matrices(
+    m2_data: bytes, anim_idx: int = 0
+) -> list[np.ndarray]:
+    """Compute world-space 4x4 matrices for all bones at animation frame 0.
+
+    Uses the pivot-sandwich pattern:
+      Local = T(pivot + trans) * R(rot) * S(scale) * T(-pivot)
+      World = parent.World * Local
+    """
+    n_bones = struct.unpack_from("<I", m2_data, 0x2C)[0]
+    ofs_bones = struct.unpack_from("<I", m2_data, 0x30)[0]
+    if n_bones == 0 or ofs_bones == 0:
+        return []
+
+    bone_size = 88
+    world_matrices: list[np.ndarray] = []
+
+    for i in range(n_bones):
+        base = ofs_bones + i * bone_size
+        if base + bone_size > len(m2_data):
+            world_matrices.append(np.eye(4, dtype=np.float64))
+            continue
+
+        parent = struct.unpack_from("<h", m2_data, base + 8)[0]
+        px, py, pz = struct.unpack_from("<3f", m2_data, base + 0x4C)
+
+        # Read frame 0 animation values from M2Tracks
+        trans = _read_m2_track_vec3(m2_data, base + 0x10, anim_idx) or (0.0, 0.0, 0.0)
+        rot = _read_m2_track_quat(m2_data, base + 0x24, anim_idx) or (0.0, 0.0, 0.0, 1.0)
+        scale = _read_m2_track_vec3(m2_data, base + 0x38, anim_idx) or (1.0, 1.0, 1.0)
+
+        # Build local matrix: T(pivot + trans) * R(rot) * S(scale) * T(-pivot)
+        t_pos = np.eye(4, dtype=np.float64)
+        t_pos[0, 3] = px + trans[0]
+        t_pos[1, 3] = py + trans[1]
+        t_pos[2, 3] = pz + trans[2]
+
+        r_mat = _quat_to_matrix(rot)
+
+        s_mat = np.eye(4, dtype=np.float64)
+        s_mat[0, 0] = scale[0]
+        s_mat[1, 1] = scale[1]
+        s_mat[2, 2] = scale[2]
+
+        t_neg = np.eye(4, dtype=np.float64)
+        t_neg[0, 3] = -px
+        t_neg[1, 3] = -py
+        t_neg[2, 3] = -pz
+
+        local = t_pos @ r_mat @ s_mat @ t_neg
+
+        if parent >= 0 and parent < len(world_matrices):
+            world = world_matrices[parent] @ local
+        else:
+            world = local
+
+        world_matrices.append(world)
+
+    return world_matrices
+
+
+def _quat_wow_to_gltf(
+    q: tuple[float, float, float, float],
+) -> list[float]:
+    """Convert a WoW-space quaternion to glTF-space.
+    WoW: X=right, Y=forward, Z=up -> glTF: X=right, Y=up, Z=-forward
+    """
+    qx, qy, qz, qw = q
+    return [qx, qz, -qy, qw]
+
+
+# Key attachment point IDs for WotLK character models
+ATTACHMENT_IDS = {
+    0: "shield_left_hand",    # Shield / left wrist / mount main hand
+    1: "right_hand",          # Main hand weapon
+    2: "left_hand",           # Off-hand weapon (not shield)
+    5: "right_shoulder",      # Right shoulder armor
+    6: "left_shoulder",       # Left shoulder armor
+    11: "helm",               # Helmet
+    26: "sheath_main_back",   # Sheathed 2H weapon (back)
+    27: "sheath_off_hip",     # Sheathed 1H weapon (hip)
+    28: "sheath_shield",      # Sheathed shield
+}
+
+
+def _read_m2_attachments(m2_data: bytes) -> list[dict]:
+    """Parse M2 attachment points. Returns list of {id, bone, position(WoW XYZ)}.
+
+    M2 header: nAttachments at 0xF0, ofsAttachments at 0xF4.
+    Each attachment is 40 bytes: id(u32), bone(u16), unk(u16), position(3xf32), anim(20 bytes).
+    """
+    if len(m2_data) < 0xF8:
+        return []
+
+    n_attach = struct.unpack_from("<I", m2_data, 0xF0)[0]
+    ofs_attach = struct.unpack_from("<I", m2_data, 0xF4)[0]
+
+    if n_attach == 0 or ofs_attach == 0:
+        return []
+
+    attach_size = 40
+    attachments = []
+    for i in range(n_attach):
+        base = ofs_attach + i * attach_size
+        if base + 20 > len(m2_data):
+            break
+        att_id = struct.unpack_from("<I", m2_data, base)[0]
+        bone = struct.unpack_from("<H", m2_data, base + 4)[0]
+        px, py, pz = struct.unpack_from("<3f", m2_data, base + 8)
+        attachments.append({"id": att_id, "bone": bone, "position": (px, py, pz)})
+
+    return attachments
+
+
+def _attachment_wow_to_gltf(pos: tuple[float, float, float]) -> list[float]:
+    """Convert WoW M2 coordinates to glTF coordinates.
+    WoW: X=right, Y=forward, Z=up
+    glTF: X=right, Y=up, Z=forward (towards viewer)
+    Conversion: glTF(x, y, z) = WoW(x, z, -y)
+    """
+    wx, wy, wz = pos
+    return [wx, wz, -wy]
+
+
+def extract_attachment_data(data_dir: str, output_path: str):
+    """Extract attachment points from all character M2 models and save as JSON.
+
+    Applies bone animation frame 0 (Stand animation) transforms to get correct
+    world-space positions and rotations for each attachment point.
+
+    Output format: { "human_male": { "0": { "position": [x,y,z], "rotation": [qx,qy,qz,qw] }, ... } }
+    Coordinates are in glTF space (same as the extracted GLB models).
+    """
+    mpq_files = []
+    for mpq_name in MPQ_LOAD_ORDER:
+        mpq_path = os.path.join(data_dir, mpq_name)
+        if os.path.exists(mpq_path):
+            mpq_files.append(mpq_path)
+
+    if not mpq_files:
+        print(f"ERROR: No MPQ files found in {data_dir}")
+        return
+
+    result = {}
+    for model_key, m2_path in RACE_MODELS.items():
+        print(f"Extracting attachments: {model_key}")
+        m2_data = None
+        for mpq_path in reversed(mpq_files):
+            try:
+                with MPQArchive(mpq_path) as mpq:
+                    m2_data = mpq.read_file(m2_path)
+                    if m2_data:
+                        break
+            except OSError:
+                continue
+
+        if not m2_data:
+            print(f"  SKIP: M2 not found")
+            continue
+
+        attachments = _read_m2_attachments(m2_data)
+        if not attachments:
+            print(f"  SKIP: No attachments found")
+            continue
+
+        # Find Stand animation (animId=0) and compute bone world matrices at frame 0
+        stand_idx = _find_stand_anim_index(m2_data)
+        print(f"  Stand animation at sequence index {stand_idx}")
+        bone_matrices = _compute_bone_world_matrices(m2_data, anim_idx=stand_idx)
+
+        # Raw attachment positions (bind pose, matches GLB vertices)
+        # No bone rotation applied — mesh is in bind pose
+        model_attachments = {}
+        for att in attachments:
+            if att["id"] not in ATTACHMENT_IDS:
+                continue
+
+            ax, ay, az = att["position"]
+            gltf_pos = _attachment_wow_to_gltf((ax, ay, az))
+            model_attachments[str(att["id"])] = {
+                "position": [round(v, 6) for v in gltf_pos],
+                "rotation": [0.0, 0.0, 0.0, 1.0],  # Identity — no rotation
+            }
+
+        result[model_key] = model_attachments
+        print(f"  Found {len(model_attachments)} key attachments out of {len(attachments)} total")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\nSaved attachment data: {output_path}")
+
+
+def extract_item_model(
+    data_dir: str,
+    model_name: str,
+    texture_name: str,
+    output_path: str,
+    component_types: list[str] | None = None,
+) -> bool:
+    """Extract an item M2 model (weapon/shield/shoulder/helm) to GLB.
+
+    Tries multiple component folders to find the M2 file.
+    Uses persistent MPQ pool for fast reads (avoids reopening multi-GB archives).
+    Returns True on success, False on failure.
+    """
+    if not model_name:
+        return False
+
+    if component_types is None:
+        component_types = ["Weapon", "Shield", "Shoulder", "Head"]
+
+    mpq_files = []
+    for mpq_name in MPQ_LOAD_ORDER:
+        mpq_path = os.path.join(data_dir, mpq_name)
+        if os.path.exists(mpq_path):
+            mpq_files.append(mpq_path)
+
+    # Strip extension (.m2 or .mdx) from the model name
+    base_name = model_name
+    for ext in [".m2", ".M2", ".mdx", ".MDX"]:
+        base_name = base_name.replace(ext, "")
+
+    m2_data = None
+    skin_data = None
+    found_type = None
+
+    for comp_type in component_types:
+        m2_mpq_path = f"Item\\ObjectComponents\\{comp_type}\\{base_name}.m2"
+        skin_mpq_path = f"Item\\ObjectComponents\\{comp_type}\\{base_name}00.skin"
+
+        m2_data = _read_from_mpqs(mpq_files, m2_mpq_path)
+        if m2_data:
+            found_type = comp_type
+            skin_data = _read_from_mpqs(mpq_files, skin_mpq_path)
+            break
+
+    if not m2_data:
+        return False
+
+    header = _read_m2_header(m2_data)
+    if not header:
+        return False
+
+    raw_verts = _read_m2_vertices(m2_data, header)
+    if raw_verts.shape[0] == 0:
+        return False
+
+    positions, normals, uvs = _parse_vertices(raw_verts)
+
+    submeshes = None
+    if skin_data:
+        submeshes = _read_skin_file(skin_data)
+
+    if not submeshes:
+        # Fallback: single submesh with all vertices as triangles
+        n_verts = positions.shape[0]
+        n_tris = n_verts - (n_verts % 3)
+        if n_tris == 0:
+            return False
+        submeshes = [{"geosetId": 0, "indices": np.arange(n_tris, dtype=np.uint32)}]
+
+    # Clip indices
+    max_idx = positions.shape[0] - 1
+    for sm in submeshes:
+        sm["indices"] = np.clip(sm["indices"], 0, max_idx)
+
+    # Load texture
+    texture_img = None
+    if texture_name:
+        tex_base = texture_name.replace(".blp", "").replace(".BLP", "")
+        for comp_type in ([found_type] if found_type else component_types):
+            tex_path = f"Item\\ObjectComponents\\{comp_type}\\{tex_base}.blp"
+            blp_data = _read_from_mpqs(mpq_files, tex_path)
+            if blp_data:
+                texture_img = decode_blp(blp_data)
+                if texture_img and texture_img.size[0] >= 4:
+                    break
+                texture_img = None
+
+    # Also try texture from M2's embedded texture entries
+    if not texture_img:
+        tex_info = _read_texture_info(m2_data, header)
+        for tex in tex_info:
+            if tex["filename"]:
+                blp_data = _read_from_mpqs(mpq_files, tex["filename"])
+                if blp_data:
+                    texture_img = decode_blp(blp_data)
+                    if texture_img and texture_img.size[0] >= 4:
+                        break
+                    texture_img = None
+
+    # For item models, all submeshes use the same single material
+    # No texture type differentiation needed (unlike character models)
+    submesh_tex_types = {sm.get("submeshIndex", i): 1 for i, sm in enumerate(submeshes)}
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    try:
+        build_glb(positions, normals, uvs, submeshes, texture_img, output_path,
+                   submesh_tex_types=submesh_tex_types)
+        return True
+    except Exception as e:
+        print(f"  ERROR building item GLB: {e}")
+        return False
+
+
 # ── Main extraction logic ───────────────────────────────────────────────
 
 # WotLK character model paths in MPQ
@@ -923,6 +1481,8 @@ def extract_character_models(data_dir: str, output_dir: str):
             print(f"  SKIP: No vertices")
             continue
 
+        # TODO: Vertex skinning requires bone lookup table from .skin file
+        # For now, extract raw bind-pose vertices (no bone transforms)
         positions, normals, uvs = _parse_vertices(raw_verts)
 
         # Get submeshes from skin file
@@ -1033,6 +1593,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract WotLK character models to glTF")
     parser.add_argument("--data-dir", default="../Data", help="Path to WoW Data directory with MPQ files")
     parser.add_argument("--output-dir", default="../frontend/public/models", help="Output directory for models")
+    parser.add_argument("--attachments-only", action="store_true", help="Only extract attachment points (skip GLB)")
     args = parser.parse_args()
 
     data_dir = os.path.abspath(args.data_dir)
@@ -1049,7 +1610,15 @@ def main():
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
-    extract_character_models(data_dir, output_dir)
+
+    if args.attachments_only:
+        attachments_path = os.path.join(output_dir, "attachments.json")
+        extract_attachment_data(data_dir, attachments_path)
+    else:
+        extract_character_models(data_dir, output_dir)
+        # Also extract attachments
+        attachments_path = os.path.join(output_dir, "attachments.json")
+        extract_attachment_data(data_dir, attachments_path)
 
     print("\nDone!")
 

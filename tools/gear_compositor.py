@@ -115,6 +115,79 @@ class ItemDisplayInfoDB:
         fields = struct.unpack_from("<" + "I" * self.field_count, self.data, offset)
         return (self._get_string(fields[1]), self._get_string(fields[3]))
 
+    def get_item_model_info(self, display_id: int) -> dict:
+        """Get full model info: left/right model names and textures for weapons/shields/shoulders/helms."""
+        offset = self._index.get(display_id)
+        if offset is None:
+            return {}
+        fields = struct.unpack_from("<" + "I" * self.field_count, self.data, offset)
+        return {
+            "leftModel": self._get_string(fields[1]),
+            "rightModel": self._get_string(fields[2]),
+            "leftTexture": self._get_string(fields[3]),
+            "rightTexture": self._get_string(fields[4]),
+        }
+
+    def get_cape_texture(self, display_id: int) -> str:
+        """Get cape texture name from ItemDisplayInfo (field 3 = leftModelTexture).
+        Cape items store their texture name in this field (e.g. 'Cape_Horde_D_01').
+        """
+        offset = self._index.get(display_id)
+        if offset is None:
+            return ""
+        fields = struct.unpack_from("<" + "I" * self.field_count, self.data, offset)
+        return self._get_string(fields[3])
+
+    def get_helmet_geoset_vis(self, display_id: int) -> tuple[int, int]:
+        """Get helmet geoset visibility flags (fields 13, 14).
+        Returns (helmetGeosetVis1, helmetGeosetVis2) - IDs into HelmetGeosetVisData.dbc.
+        """
+        offset = self._index.get(display_id)
+        if offset is None:
+            return (0, 0)
+        fields = struct.unpack_from("<" + "I" * self.field_count, self.data, offset)
+        vis1 = fields[13] if 13 < self.field_count else 0
+        vis2 = fields[14] if 14 < self.field_count else 0
+        return (vis1, vis2)
+
+
+class HelmetGeosetVisDataDB:
+    """Parse HelmetGeosetVisData.dbc: determines which geosets to hide when a helm is equipped.
+
+    Fields per record: ID, HairFlags, Facial1Flags, Facial2Flags, Facial3Flags, EarsFlags, Unk1, Unk2
+    A value of 0 means "hide this geoset group for all races". Non-zero means "show".
+    """
+
+    def __init__(self, dbc_data: bytes):
+        magic = dbc_data[0:4]
+        if magic != b"WDBC":
+            raise ValueError("Not a valid DBC file")
+        _, n_records, n_fields, rec_size, _ = struct.unpack_from("<4sIIII", dbc_data, 0)
+        self._index: dict[int, tuple[int, ...]] = {}
+        for i in range(n_records):
+            offset = 20 + i * rec_size
+            fields = struct.unpack_from("<" + "I" * n_fields, dbc_data, offset)
+            # fields: ID, Hair, Facial1, Facial2, Facial3, Ears, Unk1, Unk2
+            self._index[fields[0]] = fields[1:]
+
+    def get_visibility(self, vis_id: int) -> dict[str, bool]:
+        """Return which geoset groups should remain VISIBLE for this helmet vis ID.
+
+        Returns dict with keys: hair, facial1, facial2, facial3, ears
+        Value True = show, False = hide.
+        """
+        if vis_id == 0 or vis_id not in self._index:
+            # ID 0 or unknown = don't hide anything
+            return {"hair": True, "facial1": True, "facial2": True, "facial3": True, "ears": True}
+        fields = self._index[vis_id]
+        return {
+            "hair": fields[0] != 0,
+            "facial1": fields[1] != 0,
+            "facial2": fields[2] != 0,
+            "facial3": fields[3] != 0,
+            "ears": fields[4] != 0,
+        }
+
 
 # ── DBC lookup helpers for hair/facial hair geosets ─────────────────────
 
@@ -520,6 +593,7 @@ def compute_active_geosets(
     facial_style: int = 0,
     hair_geosets_db: CharHairGeosetsDB | None = None,
     facial_hair_db: CharFacialHairDB | None = None,
+    helmet_geoset_vis_db: HelmetGeosetVisDataDB | None = None,
 ) -> list[int]:
     """Compute which geoset IDs should be visible based on equipped items.
 
@@ -566,9 +640,9 @@ def compute_active_geosets(
         "tabard": 1200,         # no tabard (xx00 = hidden)
         "trousers": 1301,       # no trousers
         "femaleLoincloth": 1400,
-        "cloak": 1500,          # no cloak (xx00 = hidden)
+        "cloak": 1501,          # no cloak — 1501 is back body panel (skin texture)
         "noseEarrings": 1600 + nose_offset,
-        "eyeglows": 1700 + eyeglow_offset,
+        "eyeglows": 1701 + eyeglow_offset,
         "belt": 1800,           # no belt (xx00 = hidden)
         "bone": 1900,
         "feet": 2001,
@@ -594,6 +668,22 @@ def compute_active_geosets(
     if 0 in slot_items:
         g1, g2, g3 = display_info_db.get_geoset_groups(slot_items[0])
         geosets["helm"] = 2702 + g1
+
+        # Helmet geoset visibility: hide hair/facial/ears based on helm type
+        if helmet_geoset_vis_db:
+            vis1, vis2 = display_info_db.get_helmet_geoset_vis(slot_items[0])
+            if vis1:
+                vis = helmet_geoset_vis_db.get_visibility(vis1)
+                if not vis["hair"]:
+                    geosets["hair"] = 0  # Hide hair
+                if not vis["facial1"]:
+                    geosets["facial1"] = 100  # Hide facial hair group 1
+                if not vis["facial2"]:
+                    geosets["facial2"] = 200  # Hide facial hair group 2
+                if not vis["facial3"]:
+                    geosets["facial3"] = 300  # Hide facial hair group 3
+                if not vis["ears"]:
+                    geosets["ears"] = 700  # Hide ears
 
     # Shoulder (slot 2)
     if 2 in slot_items:

@@ -9,8 +9,27 @@ from routes.characters import router as characters_router
 from routes.models import router as models_router
 
 
+def _warmup_mpq_pool():
+    """Pre-open all MPQ archives at startup so first requests aren't slow."""
+    import os, sys
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(project_root, "Data")
+    tools_dir = os.path.join(project_root, "tools")
+    sys.path.insert(0, tools_dir)
+    try:
+        from extract_models import _get_mpq, MPQ_LOAD_ORDER
+        for mpq_name in MPQ_LOAD_ORDER:
+            mpq_path = os.path.join(data_dir, mpq_name)
+            if os.path.exists(mpq_path):
+                _get_mpq(mpq_path)
+        print(f"MPQ pool warmed up ({len(MPQ_LOAD_ORDER)} archives)")
+    except Exception as e:
+        print(f"MPQ warmup failed (non-critical): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _warmup_mpq_pool()
     await create_pool()
     yield
     await close_pool()

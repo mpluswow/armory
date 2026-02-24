@@ -4,11 +4,31 @@ import { OrbitControls, useGLTF } from "@react-three/drei";
 import type { Character } from "../types/character";
 import { RACES, CLASSES, CLASS_COLORS } from "../utils/constants";
 import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 const RACE_MODEL_NAMES: Record<number, string> = {
   1: "human", 2: "orc", 3: "dwarf", 4: "nightelf", 5: "undead",
   6: "tauren", 7: "gnome", 8: "troll", 10: "bloodelf", 11: "draenei",
 };
+
+interface AttachmentItem {
+  displayId: number;
+  attachPoint: string;
+  side?: string;
+  hasModel: boolean;
+}
+
+interface AttachmentPoint {
+  position: number[];
+  rotation: number[];
+}
+
+interface AttachmentsResponse {
+  attachments: Record<string, AttachmentPoint>;
+  items: Record<string, AttachmentItem>;
+  race: number;
+  gender: number;
+}
 
 function CharacterModel({
   race,
@@ -30,6 +50,9 @@ function CharacterModel({
   useEffect(() => {
     const group = groupRef.current;
     if (!group) return;
+
+    // Track loaded attachment models for cleanup
+    const attachmentModels: THREE.Object3D[] = [];
 
     // Clear previous children
     while (group.children.length) group.remove(group.children[0]);
@@ -65,8 +88,8 @@ function CharacterModel({
     const box = new THREE.Box3().setFromObject(clone);
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z);
-    const scale = 2.0 / maxDim;
-    clone.scale.setScalar(scale);
+    const charScale = 2.0 / maxDim;
+    clone.scale.setScalar(charScale);
 
     const scaledBox = new THREE.Box3().setFromObject(clone);
     const scaledCenter = scaledBox.getCenter(new THREE.Vector3());
@@ -132,7 +155,7 @@ function CharacterModel({
       });
     };
 
-    const loader = new THREE.TextureLoader();
+    const texLoader = new THREE.TextureLoader();
     const setupTexture = (tex: THREE.Texture) => {
       tex.flipY = false; // GLB textures don't flip Y
       tex.colorSpace = THREE.SRGBColorSpace;
@@ -141,7 +164,7 @@ function CharacterModel({
 
     // Load composited gear texture and apply to SKIN meshes only
     const textureUrl = `/api/model-texture/${encodeURIComponent(characterName)}`;
-    loader.load(
+    texLoader.load(
       textureUrl,
       (gearTexture) => {
         setupTexture(gearTexture);
@@ -153,7 +176,7 @@ function CharacterModel({
 
     // Load hair model texture and apply to HAIR meshes
     const hairUrl = `/api/model-hair-texture/${encodeURIComponent(characterName)}`;
-    loader.load(
+    texLoader.load(
       hairUrl,
       (hairTexture) => {
         setupTexture(hairTexture);
@@ -165,7 +188,7 @@ function CharacterModel({
 
     // Load extra skin texture (tauren fur, etc.) and apply to TYPE8 meshes
     const extraSkinUrl = `/api/model-extra-skin-texture/${encodeURIComponent(characterName)}`;
-    loader.load(
+    texLoader.load(
       extraSkinUrl,
       (extraSkinTexture) => {
         setupTexture(extraSkinTexture);
@@ -175,7 +198,88 @@ function CharacterModel({
       () => {} // Silently ignore - most races don't have type8
     );
 
+    // Load cape/cloak texture and apply to CAPE meshes (type 2)
+    const capeUrl = `/api/model-cape-texture/${encodeURIComponent(characterName)}`;
+    texLoader.load(
+      capeUrl,
+      (capeTexture) => {
+        setupTexture(capeTexture);
+        applyTextureToType(capeTexture, "cape");
+      },
+      undefined,
+      () => {} // Silently ignore - not all characters have capes
+    );
+
+    // ── Attachment Items (weapons, shields, shoulders, helms) ──
+    // Fetch attachment data and load 3D item models
+    const attachUrl = `/api/character-attachments/${encodeURIComponent(characterName)}`;
+    fetch(attachUrl)
+      .then((res) => res.json())
+      .then((data: AttachmentsResponse) => {
+        const { attachments, items } = data;
+        const gltfLoader = new GLTFLoader();
+
+        for (const [key, item] of Object.entries(items)) {
+          if (!item.hasModel || !item.displayId) continue;
+
+          const attachData = attachments[item.attachPoint];
+          if (!attachData) continue;
+
+          // Determine which side model to load
+          const side = item.side ?? (key === "offHand" ? "left" : key.includes("Left") ? "left" : "right");
+          // Helms need race/gender for race-specific models (e.g., _NiM suffix)
+          const raceParam = key === "helm" ? `&race=${data.race}&gender=${data.gender}` : "";
+          const modelUrl = `/api/item-model/${item.displayId}?side=${side}${raceParam}`;
+
+          gltfLoader.load(
+            modelUrl,
+            (gltf) => {
+              const itemModel = gltf.scene;
+
+              // Attachment position is in glTF model space (same as character GLB vertices).
+              const pos = new THREE.Vector3(
+                attachData.position[0],
+                attachData.position[1],
+                attachData.position[2],
+              );
+
+              // Create a pivot group at the attachment point
+              const pivot = new THREE.Group();
+              pivot.position.copy(pos);
+              pivot.name = `attach_${key}`;
+
+              // Apply bone rotation from Stand animation frame 0.
+              // This orients items correctly based on the bone's world transform.
+              const rot = attachData.rotation;
+              if (rot) {
+                pivot.quaternion.set(rot[0], rot[1], rot[2], rot[3]);
+              }
+
+              pivot.add(itemModel);
+
+              clone.add(pivot);
+              attachmentModels.push(pivot);
+            },
+            undefined,
+            () => {} // Silently ignore failed item model loads
+          );
+        }
+      })
+      .catch(() => {}); // Silently ignore if attachments not available
+
     return () => {
+      // Cleanup attachment models
+      for (const model of attachmentModels) {
+        model.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) {
+            const mesh = child as THREE.Mesh;
+            const mat = mesh.material as THREE.MeshStandardMaterial;
+            mat.map?.dispose();
+            mat.dispose();
+            mesh.geometry.dispose();
+          }
+        });
+      }
       clone.traverse((child) => {
         if ((child as THREE.Mesh).isMesh) {
           const mesh = child as THREE.Mesh;

@@ -11,5 +11,8 @@ dist/
 *.gltf
 frontend/public/models/characters/*.glb
 frontend/public/models/items/*.glb
+frontend/public/models/cache/*
+!frontend/public/models/cache/.gitkeep
 Data/
 *.MPQ
+logs/*.log
