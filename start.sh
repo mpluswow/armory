@@ -269,18 +269,28 @@ if [[ ! -f "$ROOT/.env" ]]; then
 fi
 _ok ".env found"
 
-if [[ ! -f "$FRONTEND_DIR/public/models/manifest.json" ]]; then
-    echo ""
-    _warn "No extracted character models found."
-    echo -e "  The 3D viewer needs models extracted from your WoW MPQ files."
-    echo -e "  Run this once (Data/ must contain your MPQ archives):"
-    echo ""
-    echo "    $TOOLS_VENV/bin/python $TOOLS_DIR/extract_models.py \\"
-    echo "      --data-dir  $ROOT/Data \\"
-    echo "      --output-dir $ROOT/frontend/public/models"
-    echo ""
+_glb_count=$(ls "$FRONTEND_DIR/public/models/characters/"*.glb 2>/dev/null | wc -l)
+if [[ ! -f "$FRONTEND_DIR/public/models/manifest.json" || "$_glb_count" -eq 0 ]]; then
+    _mpq_count=$(ls "$ROOT/Data/"*.MPQ "$ROOT/Data/"*.mpq 2>/dev/null | wc -l)
+    if [[ "$_mpq_count" -eq 0 ]]; then
+        echo ""
+        _warn "No extracted character models found AND no MPQ archives in Data/."
+        echo -e "  Place your WoW 3.3.5a MPQ archives in $ROOT/Data/ and re-run start.sh."
+        echo -e "  Expected files: patch.MPQ, patch-2.MPQ, patch-3.MPQ, common.MPQ, etc."
+        echo ""
+    else
+        echo ""
+        _log "Character models not found — running extraction pipeline (this may take a few minutes)..."
+        mkdir -p "$FRONTEND_DIR/public/models/characters"
+        "$TOOLS_VENV/bin/python" "$TOOLS_DIR/extract_models.py" \
+            --data-dir  "$ROOT/Data" \
+            --output-dir "$ROOT/frontend/public/models" \
+            || _err "Model extraction failed. Check the output above."
+        _glb_count=$(ls "$FRONTEND_DIR/public/models/characters/"*.glb 2>/dev/null | wc -l)
+        _ok "Extraction complete ($_glb_count GLB files)"
+    fi
 else
-    _ok "Character models found"
+    _ok "Character models found ($_glb_count GLB files)"
 fi
 
 # Kill any leftover processes on our ports
